@@ -92,6 +92,9 @@ def run_full_22y_orchestrator(start="2004-01-01", end="2026-08-25", initial_capi
         if s in df_closes:
             etf_sma100[s] = df_closes[s].rolling(100).mean()
 
+    # Gold 50-EMA for Trend Gate
+    gold_ema50 = df_closes[SAFE_ASSET_SYMBOL].ewm(span=50, adjust=False).mean() if SAFE_ASSET_SYMBOL in df_closes else None
+
     for t in range(warmup, len(dates)):
         curr_dt = dates[t]
         prev_dt = dates[t-1]
@@ -127,11 +130,17 @@ def run_full_22y_orchestrator(start="2004-01-01", end="2026-08-25", initial_capi
 
         regime_counts[current_regime] += 1
 
-        # Daily Return of Safe Defense Asset (GOLDBEES or Liquid Cash at 6.5% annualized)
+        # Daily Return of Safe Defense Asset with Gold 50-EMA Trend Gate
+        cash_yield = (0.065 / 252.0)  # 6.5% Annualized Liquid Cash Yield
         if SAFE_ASSET_SYMBOL in df_closes and pd.notnull(df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt]) and pd.notnull(df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt]) and df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt] > 0:
-            safe_ret = float((df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt] - df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt]) / df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt])
+            g_now = float(df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt])
+            g_ema = float(gold_ema50.loc[curr_dt]) if gold_ema50 is not None and pd.notnull(gold_ema50.loc[curr_dt]) else g_now
+            raw_gold_ret = float((df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt] - df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt]) / df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt])
+            
+            # If Gold is trending UP (> 50 EMA), hold Gold; otherwise hold 100% Cash to prevent drawdowns
+            safe_ret = raw_gold_ret if g_now > g_ema else cash_yield
         else:
-            safe_ret = (0.065 / 252.0)  # 6.5% Annualized Liquid Cash Yield
+            safe_ret = cash_yield
 
         # Daily Return of Top Sector ETFs
         sec_scores = []

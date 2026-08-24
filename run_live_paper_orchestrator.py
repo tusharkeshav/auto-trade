@@ -225,12 +225,20 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
         qty = pos["quantity"]
         risk_unit = pos["risk_unit"]
 
-        # Check Break-Even Trailing Lock (+1.50 ATR Gain)
+        # Check Break-Even Trailing Lock (+2.00 ATR Gain)
         be_locked = bool(pos.get("be_locked", 0))
-        if not be_locked and curr_px >= (entry_px + 1.50 * risk_unit):
+        if not be_locked and curr_px >= (entry_px + 2.00 * risk_unit):
             sl_px = entry_px
             be_locked = True
-            console.print(f"[bold cyan]🛡️ Trailing Stop Activated: {sym} reached +1.5R gain! SL moved to Entry (₹{entry_px:.2f})[/]")
+            console.print(f"[bold cyan]🛡️ Trailing Stop Activated: {sym} reached +2.0R gain! SL moved to Entry (₹{entry_px:.2f})[/]")
+
+        # Check Time Exit (45 trading days ≈ 65 calendar days)
+        days_held = 0
+        if pos.get("entry_date"):
+            try:
+                days_held = (now.date() - datetime.strptime(pos["entry_date"][:10], "%Y-%m-%d").date()).days
+            except Exception:
+                pass
 
         # Check SL Exit
         if curr_px <= sl_px:
@@ -274,6 +282,20 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
             console.print(f"[bold yellow]🛡️ Bear Defense Exit: Liquidated {sym} at ₹{curr_px:,.2f} to protect capital.[/]")
             notifier.notify_trade_exit(sym, pos["strategy_name"], curr_px, net_gain, (net_gain / (entry_px * qty)) * 100.0 if (entry_px * qty) > 0 else 0.0, "BEAR_DEFENSE_ROTATION", tax)
 
+        # Check Time-Based Forced Exit (45 trading days)
+        elif days_held >= 65 and sym != SAFE_ASSET_SYMBOL:
+            b_c, s_c = calculate_round_trip_cost(entry_px, curr_px, qty, "CNC")
+            tax = b_c.total + s_c.total
+            gross_sale = curr_px * qty
+            net_gain = (curr_px - entry_px) * qty - tax
+
+            db.close_position(sym, curr_px, today_str, "TIME_EXIT", tax)
+            cash += gross_sale - s_c.total
+            realized_pnl += net_gain
+            total_taxes += tax
+            console.print(f"[bold yellow]⏰ Time Exit (45d Stagnation): Liquidated {sym} at ₹{curr_px:,.2f} | Net P&L: ₹{net_gain:,.2f}[/]")
+            notifier.notify_trade_exit(sym, pos["strategy_name"], curr_px, net_gain, (net_gain / (entry_px * qty)) * 100.0 if (entry_px * qty) > 0 else 0.0, "TIME_EXIT", tax)
+
         else:
             db.update_position_price(sym, curr_px, be_locked=be_locked, stop_loss=sl_px)
             invested += curr_px * qty
@@ -283,33 +305,38 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
     available_slots = MAX_OPEN_POSITIONS - len(open_pos)
 
     if regime == "BEAR_DEFENSE":
-        # Allocate 100% to GOLDBEES
-        if SAFE_ASSET_SYMBOL not in [p["symbol"] for p in open_pos] and cash > 2000:
-            df_gold = data_map.get(SAFE_ASSET_SYMBOL)
-            if df_gold is not None:
-                g_px = float(df_gold["close"].iloc[-1])
-                g_qty = math.floor((cash * 0.95) / g_px)
-                if g_qty > 0:
-                    b_c, _ = calculate_round_trip_cost(g_px, g_px, g_qty, "CNC")
-                    invest_cost = g_qty * g_px + b_c.total
-                    if cash >= invest_cost:
-                        cash -= invest_cost
-                        total_taxes += b_c.total
-                        invested += g_qty * g_px
-                        db.add_position({
-                            "symbol": SAFE_ASSET_SYMBOL,
-                            "strategy_name": "Sovereign Gold Defense Shield",
-                            "entry_date": today_str,
-                            "entry_price": g_px,
-                            "quantity": g_qty,
-                            "current_price": g_px,
-                            "stop_loss": round(g_px * 0.95, 2),
-                            "take_profit": round(g_px * 1.25, 2),
-                            "risk_unit": round(g_px * 0.05, 2),
-                            "be_locked": False,
-                        })
-                        console.print(f"[bold yellow]🛡️ Entered Sovereign Gold Defense: Bought {g_qty} units of GOLDBEES at ₹{g_px:.2f}[/]")
-                        notifier.notify_trade_entry(SAFE_ASSET_SYMBOL, "Sovereign Gold Defense Shield", g_px, g_qty, round(g_px * 0.95, 2), round(g_px * 1.25, 2), 5.0, regime)
+        df_gold = data_map.get(SAFE_ASSET_SYMBOL)
+        if df_gold is not None and len(df_gold) >= 50:
+            g_px = float(df_gold["close"].iloc[-1])
+            g_ema50 = float(df_gold["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+
+            # Gold 50-EMA Trend Gate: Only buy Gold if Gold > 50-EMA
+            if g_px > g_ema50:
+                if SAFE_ASSET_SYMBOL not in [p["symbol"] for p in open_pos] and cash > 2000:
+                    g_qty = math.floor((cash * 0.95) / g_px)
+                    if g_qty > 0:
+                        b_c, _ = calculate_round_trip_cost(g_px, g_px, g_qty, "CNC")
+                        invest_cost = g_qty * g_px + b_c.total
+                        if cash >= invest_cost:
+                            cash -= invest_cost
+                            total_taxes += b_c.total
+                            invested += g_qty * g_px
+                            db.add_position({
+                                "symbol": SAFE_ASSET_SYMBOL,
+                                "strategy_name": "Sovereign Gold Defense Shield",
+                                "entry_date": today_str,
+                                "entry_price": g_px,
+                                "quantity": g_qty,
+                                "current_price": g_px,
+                                "stop_loss": round(g_px * 0.92, 2),    # 8.0% SL
+                                "take_profit": round(g_px * 1.15, 2),  # 15.0% TP
+                                "risk_unit": round(g_px * 0.08, 2),
+                                "be_locked": False,
+                            })
+                            console.print(f"[bold yellow]🛡️ Entered Sovereign Gold Defense: Bought {g_qty} units of GOLDBEES at ₹{g_px:.2f} (SL: ₹{g_px*0.92:.2f}, TP: ₹{g_px*1.15:.2f})[/]")
+                            notifier.notify_trade_entry(SAFE_ASSET_SYMBOL, "Sovereign Gold Defense Shield", g_px, g_qty, round(g_px * 0.92, 2), round(g_px * 1.15, 2), 1.88, regime)
+            else:
+                console.print(f"[bold cyan]🛡️ Gold Defense Gate: GOLDBEES (₹{g_px:.2f}) is below 50 EMA (₹{g_ema50:.2f}). Holding 100% Cash Shield to prevent drawdown.[/]")
 
     elif available_slots > 0 and cash > 5000:
         alloc_per_slot = cash / available_slots
@@ -348,7 +375,7 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
                 total_order_cost = (qty * px) + b_c.total
                 if cash >= total_order_cost:
                     sl = round(px - 1.25 * atr, 2)
-                    tp = round(px + 3.50 * atr, 2)
+                    tp = round(px + 4.00 * atr, 2)
                     cash -= total_order_cost
                     total_taxes += b_c.total
                     invested += qty * px
@@ -366,7 +393,7 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
                         "be_locked": False,
                     })
                     console.print(f"[bold green]🚀 Paper Buy Executed: {qty} shs of {sym} at ₹{px:,.2f} (SL: ₹{sl:,.2f} | TP: ₹{tp:,.2f})[/]")
-                    notifier.notify_trade_entry(sym, strat, px, qty, sl, tp, 2.8, regime)
+                    notifier.notify_trade_entry(sym, strat, px, qty, sl, tp, 3.2, regime)
 
     # 5. Update SQLite State
     current_nav = cash + invested

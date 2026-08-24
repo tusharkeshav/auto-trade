@@ -1,0 +1,9 @@
+{
+  "telegram_bot_token": "8877994842:AAEeCparUlyQBzy45L5cuwtbTfz-ClbPEUg",
+  "telegram_chat_ids": [
+    "1292507208",
+    "8931985247"
+  ],
+  "ntfy_topic": "akhil_quant_alerts",
+  "enabled": true
+}

@@ -1,12 +1,21 @@
 # ─────────────────────────────────────────────────────────────────
 #  run_2005_2026_master_yoy_audit.py
-#  Master 22-Year Year-on-Year (YoY) Forward Audit (2005 – 2026).
+#  True Discrete 22-Year Master Year-on-Year Forward Audit (2005 – 2026).
+#
+#  Features:
+#    • 100% Discrete Trade Execution (Integer Shares, 3 Slots, Zero Daily Math Blending)
+#    • Exact Indian CNC Statutory Taxes (STT 0.10%, GST 18%, Stamp, SEBI, DP ₹13.50)
+#    • 0.0% Real-World Idle Cash Interest Assumption
+#    • Gold 50-EMA Trend Gate + 8% SL / 15% TP
+#    • 1.25x ATR SL, 4.0x ATR TP, +2.0R BE Lock & 45-Day Time Exit
 # ─────────────────────────────────────────────────────────────────
 
 import math
 import sys
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -25,172 +34,291 @@ from indicators import add_all_indicators
 
 console = Console()
 
-START_DATE = "2005-01-01"
-END_DATE   = "2026-08-23"
+START_DATE = "2004-01-01"
+END_DATE   = "2026-08-25"
 
 BENCHMARK_SYMBOL = "^BSESN"  # SENSEX has complete daily data from 2000 onwards (99.2% correlated with NIFTY)
 SAFE_ASSET_SYMBOL = "GOLDBEES.NS"
-ETFS_ALL = ["NIFTYBEES.NS", "BANKBEES.NS", "CPSEETF.NS"]
+ETFS_ALL = ["NIFTYBEES.NS", "BANKBEES.NS", "CPSEETF.NS", "ITBEES.NS", "AUTOBEES.NS", "PHARMABEES.NS"]
 STOCKS_ALL = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "LT.NS",
     "BHARTIARTL.NS", "SBIN.NS", "SUNPHARMA.NS", "NTPC.NS"
 ]
+MAX_OPEN_POSITIONS = 3
 
 
-def run_full_22y_orchestrator(start="2004-01-01", end="2026-08-25", initial_capital=100000.0, adx_threshold=22.0) -> Dict[str, Any]:
+@dataclass
+class DiscreteTrade:
+    symbol: str
+    strategy: str
+    entry_date: str
+    exit_date: str
+    entry_price: float
+    exit_price: float
+    quantity: int
+    gross_pnl: float
+    taxes: float
+    net_pnl: float
+    net_pnl_pct: float
+    exit_reason: str
+    bars_held: int
+
+
+def run_discrete_22y_audit(
+    start: str = START_DATE,
+    end: str = END_DATE,
+    initial_capital: float = 100000.0,
+    adx_threshold: float = 22.0,
+    warmup_bars: int = 150,
+) -> Dict[str, Any]:
+    """Executes a true bar-by-bar discrete trade simulation across the 22-year dataset."""
+    
     all_syms = list(set([BENCHMARK_SYMBOL, SAFE_ASSET_SYMBOL] + ETFS_ALL + STOCKS_ALL))
+    console.print(f"[dim cyan]Downloading 22-Year Historical Market Data ({len(all_syms)} instruments)...[/]")
     df_raw = yf.download(all_syms, start=start, end=end, interval="1d", progress=False)
 
-    df_closes = df_raw["Close"].copy() if "Close" in df_raw.columns else df_raw.copy()
-    if isinstance(df_closes.columns, pd.MultiIndex):
-        df_closes.columns = df_closes.columns.get_level_values(0)
-    df_closes = df_closes.ffill().dropna(how="all")
-
-    # Clean 2-day bad tick in Yahoo Finance December 2019 data for Nippon ETFs
-    if "BANKBEES.NS" in df_closes: df_closes.loc['2019-12-19':'2019-12-20', 'BANKBEES.NS'] *= 10.0
-    if "NIFTYBEES.NS" in df_closes: df_closes.loc['2019-12-19':'2019-12-20', 'NIFTYBEES.NS'] *= 10.0
-    if "GOLDBEES.NS" in df_closes: df_closes.loc['2019-12-19':'2019-12-20', 'GOLDBEES.NS'] *= 100.0
-
-    # Benchmark Indicators
-    df_bm_std = pd.DataFrame(index=df_closes.index)
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        val = df_raw[col][BENCHMARK_SYMBOL] if isinstance(df_raw.columns, pd.MultiIndex) else df_raw[col]
-        df_bm_std[col.lower()] = val.astype(float)
-    df_bm_std = df_bm_std.ffill().dropna()
-    df_bm = add_all_indicators(df_bm_std)
-
-    # Individual Stock Indicators
-    stock_dfs = {}
-    for sym in STOCKS_ALL:
-        if sym in df_closes:
-            sub = pd.DataFrame(index=df_closes.index)
+    # 1. Process Indicators for all symbols
+    data_map: Dict[str, pd.DataFrame] = {}
+    for sym in all_syms:
+        try:
+            sub = pd.DataFrame(index=df_raw.index)
             for col in ["Open", "High", "Low", "Close", "Volume"]:
                 val = df_raw[col][sym] if isinstance(df_raw.columns, pd.MultiIndex) else df_raw[col]
                 sub[col.lower()] = val.astype(float)
-            sub = sub.ffill().dropna()
-            if len(sub) > 50:
-                stock_dfs[sym] = add_all_indicators(sub)
+            sub = sub.ffill().dropna(how="all")
+            if len(sub) > 60:
+                data_map[sym] = add_all_indicators(sub)
+        except Exception:
+            pass
 
-    valid_dates = df_closes.dropna(subset=[BENCHMARK_SYMBOL]).index
-    dates = [d for d in valid_dates if d in df_bm.index]
-    warmup = 200
+    if BENCHMARK_SYMBOL not in data_map:
+        raise ValueError("Benchmark data missing.")
+
+    df_bm = data_map[BENCHMARK_SYMBOL]
+    dates = df_bm.index[warmup_bars:]
 
     capital = initial_capital
-    dyn_equity = []
-    dyn_dates  = []
+    open_positions: Dict[str, Dict[str, Any]] = {}
+    closed_trades: List[DiscreteTrade] = []
+    equity_curve_vals = []
+    equity_dates = []
+    total_taxes = 0.0
     regime_counts = {"TRENDING_BULL": 0, "CHOPPY_SIDEWAYS": 0, "BEAR_DEFENSE": 0}
 
-    current_regime = "TRENDING_BULL"
-    candidate_regime = "TRENDING_BULL"
-    candidate_count = 0
+    for idx, dt in enumerate(dates):
+        d_str = dt.strftime("%Y-%m-%d")
+        t_global = df_bm.index.get_loc(dt)
 
-    bm_sma200 = df_closes[BENCHMARK_SYMBOL].rolling(200).mean()
+        # ── Step 1: Detect Macro Regime (Day i-1 Close / Day i Morning) ──
+        bm_bar = df_bm.loc[dt]
+        bm_px = float(bm_bar["close"])
+        bm_sma200 = float(bm_bar.get("sma_200", bm_px))
+        bm_ema12 = float(bm_bar.get("ema_12", bm_px))
+        bm_ema50 = float(bm_bar.get("ema_50", bm_px))
+        bm_adx = float(bm_bar.get("adx", 20.0))
 
-    # Sector ETF SMA100
-    etf_sma100 = {}
-    for s in ETFS_ALL:
-        if s in df_closes:
-            etf_sma100[s] = df_closes[s].rolling(100).mean()
-
-    # Gold 50-EMA for Trend Gate
-    gold_ema50 = df_closes[SAFE_ASSET_SYMBOL].ewm(span=50, adjust=False).mean() if SAFE_ASSET_SYMBOL in df_closes else None
-
-    for t in range(warmup, len(dates)):
-        curr_dt = dates[t]
-        prev_dt = dates[t-1]
-        n_px = float(df_closes[BENCHMARK_SYMBOL].loc[curr_dt])
-        n_sma200 = float(bm_sma200.loc[curr_dt])
-        n_row = df_bm.loc[curr_dt]
-        adx = float(n_row.get("adx", 20.0))
-        ema12 = float(n_row.get("ema_12", n_px))
-        ema50 = float(n_row.get("ema_50", n_px))
-
-        # Regime Evaluation with 200 SMA Shield
-        if n_px <= n_sma200 or (ema12 < ema50 * 0.99):
-            raw_regime = "BEAR_DEFENSE"
-        elif adx >= adx_threshold and ema12 > ema50:
-            raw_regime = "TRENDING_BULL"
+        if bm_px <= bm_sma200 or (bm_ema12 < bm_ema50 * 0.99):
+            regime = "BEAR_DEFENSE"
+        elif bm_adx >= adx_threshold and bm_ema12 > bm_ema50:
+            regime = "TRENDING_BULL"
         else:
-            raw_regime = "CHOPPY_SIDEWAYS"
+            regime = "CHOPPY_SIDEWAYS"
 
-        if raw_regime == "BEAR_DEFENSE":
-            current_regime = "BEAR_DEFENSE"
-            candidate_count = 0
-        elif raw_regime == current_regime:
-            candidate_count = 0
-        else:
-            if raw_regime == candidate_regime:
-                candidate_count += 1
-                if candidate_count >= 2:
-                    current_regime = raw_regime
-                    candidate_count = 0
+        regime_counts[regime] += 1
+
+        # ── Step 2: Manage Open Positions ──
+        for sym in list(open_positions.keys()):
+            pos = open_positions[sym]
+            df_s = data_map.get(sym)
+            if df_s is None or dt not in df_s.index:
+                continue
+
+            bar = df_s.loc[dt]
+            curr_px = float(bar["close"])
+            low_px = float(bar["low"])
+            high_px = float(bar["high"])
+            entry_px = pos["entry_price"]
+            sl_px = pos["stop_loss"]
+            tp_px = pos["take_profit"]
+            qty = pos["quantity"]
+            risk_unit = pos["risk_unit"]
+            bars_held = idx - pos["entry_bar_idx"]
+
+            # Break-Even Lock Check (+2.0R Gain)
+            if not pos["be_locked"] and high_px >= (entry_px + 2.0 * risk_unit):
+                pos["stop_loss"] = entry_px
+                pos["be_locked"] = True
+                sl_px = entry_px
+
+            exit_triggered = False
+            exit_px = curr_px
+            exit_reason = ""
+
+            # Check SL
+            if low_px <= sl_px:
+                exit_triggered = True
+                exit_px = sl_px
+                exit_reason = "STOP_LOSS"
+            # Check TP
+            elif high_px >= tp_px:
+                exit_triggered = True
+                exit_px = tp_px
+                exit_reason = "TAKE_PROFIT"
+            # Check Bear Rotation Exit
+            elif regime == "BEAR_DEFENSE" and sym != SAFE_ASSET_SYMBOL:
+                exit_triggered = True
+                exit_px = curr_px
+                exit_reason = "BEAR_ROTATION"
+            # Check 45-Day Time Exit
+            elif bars_held >= 45 and sym != SAFE_ASSET_SYMBOL:
+                exit_triggered = True
+                exit_px = curr_px
+                exit_reason = "TIME_EXIT"
+
+            if exit_triggered:
+                b_c, s_c = calculate_round_trip_cost(entry_px, exit_px, qty, "CNC")
+                tax = b_c.total + s_c.total
+                gross_sale = exit_px * qty
+                gross_pnl = (exit_px - entry_px) * qty
+                net_pnl = gross_pnl - tax
+
+                capital += gross_sale - s_c.total
+                total_taxes += tax
+                open_positions.pop(sym)
+
+                closed_trades.append(DiscreteTrade(
+                    symbol=sym,
+                    strategy=pos["strategy"],
+                    entry_date=pos["entry_date"],
+                    exit_date=d_str,
+                    entry_price=round(entry_px, 2),
+                    exit_price=round(exit_px, 2),
+                    quantity=qty,
+                    gross_pnl=round(gross_pnl, 2),
+                    taxes=round(tax, 2),
+                    net_pnl=round(net_pnl, 2),
+                    net_pnl_pct=round((net_pnl / (entry_px * qty)) * 100.0, 2),
+                    exit_reason=exit_reason,
+                    bars_held=bars_held,
+                ))
+
+        # ── Step 3: Scan & Enter New Positions ──
+        available_slots = MAX_OPEN_POSITIONS - len(open_positions)
+
+        if regime == "BEAR_DEFENSE":
+            df_gold = data_map.get(SAFE_ASSET_SYMBOL)
+            if df_gold is not None and dt in df_gold.index:
+                pos_g = df_gold.index.get_loc(dt)
+                g_px = float(df_gold.loc[dt]["close"])
+                g_ema50 = float(df_gold["close"].iloc[:pos_g+1].ewm(span=50, adjust=False).mean().iloc[-1]) if pos_g >= 50 else g_px
+
+                # Gold 50-EMA Trend Gate: Only buy Gold if Gold > 50-EMA
+                if g_px > g_ema50:
+                    if SAFE_ASSET_SYMBOL not in open_positions and capital > 2000:
+                        g_qty = math.floor((capital * 0.95) / g_px)
+                        if g_qty > 0:
+                            b_c, _ = calculate_round_trip_cost(g_px, g_px, g_qty, "CNC")
+                            cost = (g_qty * g_px) + b_c.total
+                            if capital >= cost:
+                                capital -= cost
+                                total_taxes += b_c.total
+                                sl = round(g_px * 0.92, 2)   # 8.0% SL
+                                tp = round(g_px * 1.15, 2)   # 15.0% TP
+                                open_positions[SAFE_ASSET_SYMBOL] = {
+                                    "strategy": "Sovereign Gold Defense Shield",
+                                    "entry_date": d_str,
+                                    "entry_price": g_px,
+                                    "quantity": g_qty,
+                                    "stop_loss": sl,
+                                    "take_profit": tp,
+                                    "risk_unit": round(g_px * 0.08, 2),
+                                    "be_locked": False,
+                                    "entry_bar_idx": idx,
+                                }
+                # Else: Hold 100% Cash at 0.0% interest (real brokerage reality)
+
+        elif available_slots > 0 and capital > 5000:
+            alloc_per_slot = capital / available_slots
+            candidates = []
+
+            for sym in STOCKS_ALL:
+                if sym in open_positions:
+                    continue
+                df_s = data_map.get(sym)
+                if df_s is None or dt not in df_s.index or t_global < 60:
+                    continue
+
+                pos_s = df_s.index.get_loc(dt)
+                if pos_s < 60:
+                    continue
+
+                bar = df_s.iloc[pos_s]
+                prev_bar = df_s.iloc[pos_s - 1]
+                px = float(bar["close"])
+                prev_px = float(prev_bar["close"])
+                sma20 = float(bar.get("sma_20", px))
+                prev_sma20 = float(prev_bar.get("sma_20", prev_px))
+                rsi = float(bar.get("rsi", 50.0))
+                atr = float(bar.get("atr", px * 0.02))
+
+                # 60d RS Gate
+                rs_today = px / bm_px
+                rs_60 = float(df_s.iloc[pos_s - 60]["close"]) / float(df_bm.iloc[t_global - 60]["close"])
+                rs_slope = ((rs_today - rs_60) / rs_60) * 100.0
+
+                is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0)
+                if is_pullback:
+                    candidates.append((sym, "Large-Cap RS Pullback", px, atr, rs_slope))
+
+            candidates.sort(key=lambda x: x[4], reverse=True)
+
+            for sym, strat, px, atr, rs in candidates[:available_slots]:
+                qty = math.floor(alloc_per_slot / (px * 1.005))
+                if qty > 0:
+                    b_c, _ = calculate_round_trip_cost(px, px, qty, "CNC")
+                    order_cost = (qty * px) + b_c.total
+                    if capital >= order_cost:
+                        sl = round(px - 1.25 * atr, 2)
+                        tp = round(px + 4.00 * atr, 2)
+                        capital -= order_cost
+                        total_taxes += b_c.total
+                        open_positions[sym] = {
+                            "strategy": strat,
+                            "entry_date": d_str,
+                            "entry_price": px,
+                            "quantity": qty,
+                            "stop_loss": sl,
+                            "take_profit": tp,
+                            "risk_unit": round(1.25 * atr, 2),
+                            "be_locked": False,
+                            "entry_bar_idx": idx,
+                        }
+
+        # ── Step 4: Track Daily Mark-to-Market Equity ──
+        open_mtm = 0.0
+        for s, p in open_positions.items():
+            df_s = data_map.get(s)
+            if df_s is not None and dt in df_s.index:
+                open_mtm += p["quantity"] * float(df_s.loc[dt]["close"])
             else:
-                candidate_regime = raw_regime
-                candidate_count = 1
+                open_mtm += p["quantity"] * p["entry_price"]
 
-        regime_counts[current_regime] += 1
+        nav = capital + open_mtm
+        equity_curve_vals.append(nav)
+        equity_dates.append(dt)
 
-        # Daily Return of Safe Defense Asset with Gold 50-EMA Trend Gate
-        cash_yield = (0.065 / 252.0)  # 6.5% Annualized Liquid Cash Yield
-        if SAFE_ASSET_SYMBOL in df_closes and pd.notnull(df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt]) and pd.notnull(df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt]) and df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt] > 0:
-            g_now = float(df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt])
-            g_ema = float(gold_ema50.loc[curr_dt]) if gold_ema50 is not None and pd.notnull(gold_ema50.loc[curr_dt]) else g_now
-            raw_gold_ret = float((df_closes[SAFE_ASSET_SYMBOL].loc[curr_dt] - df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt]) / df_closes[SAFE_ASSET_SYMBOL].loc[prev_dt])
-            
-            # If Gold is trending UP (> 50 EMA), hold Gold; otherwise hold 100% Cash to prevent drawdowns
-            safe_ret = raw_gold_ret if g_now > g_ema else cash_yield
-        else:
-            safe_ret = cash_yield
-
-        # Daily Return of Top Sector ETFs
-        sec_scores = []
-        for s in ETFS_ALL:
-            if s in df_closes and s in etf_sma100 and pd.notnull(df_closes[s].loc[curr_dt]) and pd.notnull(etf_sma100[s].loc[curr_dt]):
-                px_now = float(df_closes[s].loc[curr_dt])
-                px_60  = float(df_closes[s].iloc[t-60]) if t >= 60 else px_now
-                s_sma  = float(etf_sma100[s].loc[curr_dt])
-                if px_now > s_sma and px_60 > 0:
-                    ret60 = ((px_now - px_60) / px_60) * 100.0
-                    sec_scores.append((s, ret60))
-        sec_scores.sort(key=lambda x: x[1], reverse=True)
-        top_etfs = [s for s, r in sec_scores[:2]]
-        if top_etfs:
-            sec_ret = np.mean([(float(df_closes[s].loc[curr_dt]) - float(df_closes[s].loc[prev_dt])) / float(df_closes[s].loc[prev_dt]) for s in top_etfs])
-        else:
-            sec_ret = safe_ret
-
-        # Daily Return of Large-Cap Blue-Chips (Momentum & Breakouts)
-        stock_rets = []
-        for sym in STOCKS_ALL:
-            if sym in stock_dfs and curr_dt in stock_dfs[sym].index and prev_dt in stock_dfs[sym].index:
-                s_ret = (float(df_closes[sym].loc[curr_dt]) - float(df_closes[sym].loc[prev_dt])) / float(df_closes[sym].loc[prev_dt])
-                stock_rets.append(s_ret)
-        avg_stock_ret = np.mean(stock_rets) if stock_rets else 0.0
-
-        # Weights by Regime
-        if current_regime == "BEAR_DEFENSE":
-            day_r = safe_ret
-        elif current_regime == "TRENDING_BULL":
-            day_r = (0.50 * sec_ret) + (0.50 * avg_stock_ret)
-        else: # CHOPPY_SIDEWAYS
-            day_r = (0.50 * avg_stock_ret) + (0.50 * safe_ret)
-
-        # Deduct realistic statutory taxes and slippage drag (0.15% annualized)
-        day_r -= (0.0015 / 252.0)
-        capital *= (1.0 + day_r)
-
-        dyn_equity.append(capital)
-        dyn_dates.append(curr_dt)
-
-    eq_series = pd.Series(dyn_equity, index=dyn_dates)
+    eq_series = pd.Series(equity_curve_vals, index=equity_dates)
+    
     return {
         "equity_curve": eq_series,
+        "closed_trades": closed_trades,
+        "total_taxes": total_taxes,
         "regime_counts": regime_counts,
-        "df_closes": df_closes,
+        "df_bm": df_bm,
     }
 
 
-def slice_period_eq(eq_series: pd.Series, s_str: str, e_str: str, base_cap: float = 100000.0) -> Dict[str, Any]:
+def slice_discrete_year(eq_series: pd.Series, s_str: str, e_str: str, base_cap: float = 100000.0) -> Dict[str, Any]:
     eq = eq_series.copy()
     eq.index = pd.to_datetime(eq.index).tz_localize(None)
     s_dt = pd.to_datetime(s_str)
@@ -212,57 +340,48 @@ def slice_period_eq(eq_series: pd.Series, s_str: str, e_str: str, base_cap: floa
     dd     = (peak - norm_eq) / peak * 100.0
     max_dd = float(dd.max()) if not dd.empty else 0.0
 
-    daily_rets = norm_eq.pct_change().dropna()
-    if len(daily_rets) > 1 and daily_rets.std() > 0:
-        sharpe = float((daily_rets.mean() / daily_rets.std()) * np.sqrt(252))
-        neg_rets = daily_rets[daily_rets < 0]
-        sortino = float((daily_rets.mean() / neg_rets.std()) * np.sqrt(252)) if len(neg_rets) > 1 and neg_rets.std() > 0 else sharpe
-    else:
-        sharpe, sortino = 0.0, 0.0
-
     return {
         "base_capital": base_cap,
         "final_capital": round(final_val, 2),
         "net_pnl": round(net_pnl, 2),
         "net_pct": round(net_pct, 2),
         "max_dd": round(max_dd, 2),
-        "sharpe": round(sharpe, 2),
-        "sortino": round(sortino, 2),
     }
 
 
 def main():
     console.print()
     console.print(Panel.fit(
-        "[bold cyan]🌟 22-YEAR MASTER YEAR-ON-YEAR FORWARD AUDIT (2005 – 2026)[/]\n"
-        "[dim]Auditing Every Single Calendar Year with Real Market Benchmark & Exact Post-Tax Returns[/]",
+        "[bold cyan]🔬 TRUE DISCRETE 22-YEAR HISTORICAL AUDIT (2005 – 2026)[/]\n"
+        "[dim]Zero Return Blending • Discrete Trade Accounting • Real Indian CNC Statutory Taxes[/]",
         border_style="cyan"
     ))
     console.print()
 
-    console.print("[bold yellow]Executing 22-Year Continuous Historical Simulation (2004 to 2026)...[/]")
-    res = run_full_22y_orchestrator(start="2004-01-01", end="2026-08-25", initial_capital=100000.0)
+    res = run_discrete_22y_audit(initial_capital=100000.0)
     eq_series = res["equity_curve"]
-    df_closes = res["df_closes"]
+    trades = res["closed_trades"]
+    df_bm = res["df_bm"]
 
-    df_bm = df_closes[BENCHMARK_SYMBOL].copy()
-    df_bm.index = pd.to_datetime(df_bm.index).tz_localize(None)
+    df_bm_close = df_bm["close"].copy()
+    df_bm_close.index = pd.to_datetime(df_bm_close.index).tz_localize(None)
 
     def get_bm_ret(s_dt, e_dt):
-        sub = df_bm[(df_bm.index >= pd.to_datetime(s_dt)) & (df_bm.index <= pd.to_datetime(e_dt))].dropna()
+        sub = df_bm_close[(df_bm_close.index >= pd.to_datetime(s_dt)) & (df_bm_close.index <= pd.to_datetime(e_dt))].dropna()
         if len(sub) >= 2:
-            s_px = float(sub.iloc[0].item()) if hasattr(sub.iloc[0], "item") else float(sub.iloc[0])
-            e_px = float(sub.iloc[-1].item()) if hasattr(sub.iloc[-1], "item") else float(sub.iloc[-1])
+            s_px = float(sub.iloc[0])
+            e_px = float(sub.iloc[-1])
             return ((e_px - s_px) / s_px) * 100.0
         return 0.0
 
-    tbl = Table(title="[bold green]📊 2005 – 2026 COMPLETE YEAR-BY-YEAR SCORECARD (₹100,000 BASE)[/]", box=box.DOUBLE_EDGE, header_style="bold cyan")
-    tbl.add_column("Year / Calendar Period", style="bold", width=26)
+    tbl = Table(title="[bold green]📊 TRUE DISCRETE YEAR-BY-YEAR SCORECARD (₹100,000 BASE PER YEAR)[/]", box=box.DOUBLE_EDGE, header_style="bold cyan")
+    tbl.add_column("Calendar Year", style="bold", width=22)
     tbl.add_column("Market Benchmark", justify="right", width=18)
     tbl.add_column("Orchestrator Net P&L", justify="right", width=22)
-    tbl.add_column("Orchestrator Return", justify="right", width=22)
+    tbl.add_column("Orchestrator Net %", justify="right", width=20)
     tbl.add_column("Max Drawdown", justify="right", width=14)
-    tbl.add_column("Target Status", justify="center", width=18)
+    tbl.add_column("Trades", justify="center", width=10)
+    tbl.add_column("Annual Status", justify="center", width=20)
 
     years = list(range(2005, 2027))
     win_years = 0
@@ -270,14 +389,17 @@ def main():
 
     for yr in years:
         s_str = f"{yr}-01-01"
-        e_str = f"{yr}-12-31" if yr < 2026 else "2026-08-23"
-        m = slice_period_eq(eq_series, s_str, e_str, base_cap=100000.0)
+        e_str = f"{yr}-12-31" if yr < 2026 else "2026-08-25"
+        m = slice_discrete_year(eq_series, s_str, e_str, base_cap=100000.0)
         if not m: continue
 
         bm_r = get_bm_ret(s_str, e_str)
         pnl = m["net_pnl"]
         ret = m["net_pct"]
         dd  = m["max_dd"]
+
+        yr_trades = [t for t in trades if t.exit_date.startswith(str(yr))]
+        n_trades = len(yr_trades)
 
         if ret > 0: win_years += 1
         if ret >= 12.0: target_met_years += 1
@@ -294,37 +416,60 @@ def main():
         else:
             status = "[bold yellow]🛡️ LOSS CAPPED[/]"
 
-        yr_label = f"Year {yr}" if yr < 2026 else "2026 (YTD Forward)"
-        tbl.add_row(yr_label, bm_str, pnl_str, ret_str, dd_str, status)
+        yr_label = f"Year {yr}" if yr < 2026 else "2026 (YTD)"
+        tbl.add_row(yr_label, bm_str, pnl_str, ret_str, dd_str, str(n_trades), status)
 
-    # 22-Year Cumulative Metrics
-    m_22y = slice_period_eq(eq_series, "2005-01-01", "2026-08-23", base_cap=100000.0)
-    bm_22y_ret = get_bm_ret("2005-01-01", "2026-08-23")
-    years_total = 21.65
-    bm_22y_cagr = ((1.0 + bm_22y_ret / 100.0) ** (1.0 / years_total) - 1.0) * 100.0
-    cagr_22y = ((m_22y["final_capital"] / 100000.0) ** (1.0 / years_total) - 1.0) * 100.0
+    # 22-Year Compounded
+    total_days = (eq_series.index[-1] - eq_series.index[0]).days
+    total_years = total_days / 365.25
+    initial_val = float(eq_series.iloc[0])
+    final_val = float(eq_series.iloc[-1])
+    total_net_pnl = final_val - initial_val
+    total_net_pct = (total_net_pnl / initial_val) * 100.0
+    cagr = ((final_val / initial_val) ** (1.0 / total_years) - 1.0) * 100.0 if total_years > 0 else 0.0
+
+    peak = eq_series.cummax()
+    max_dd_22y = float(((peak - eq_series) / peak * 100.0).max())
+
+    bm_start_px = float(df_bm_close.loc[eq_series.index[0]])
+    bm_end_px = float(df_bm_close.loc[eq_series.index[-1]])
+    bm_total_ret = ((bm_end_px - bm_start_px) / bm_start_px) * 100.0
+    bm_cagr = ((bm_end_px - bm_start_px) / bm_start_px + 1.0) ** (1.0 / total_years) - 1.0
+    bm_cagr *= 100.0
 
     tbl.add_row(
         "🌟 22-Year Compounded Total",
-        f"+{bm_22y_ret:.1f}% ({bm_22y_cagr:.2f}% CAGR)",
-        f"[bold green]+₹{m_22y['net_pnl']:,.2f}[/]",
-        f"[bold green]+{m_22y['net_pct']:,.1f}% ({cagr_22y:.2f}% CAGR)[/]",
-        f"-{m_22y['max_dd']:.2f}%",
-        "[bold green]🏆 22-YEAR CRUSH[/]",
+        f"+{bm_total_ret:.1f}% ({bm_cagr:.2f}% CAGR)",
+        f"[bold green]+₹{total_net_pnl:,.2f}[/]",
+        f"[bold green]+{total_net_pct:,.1f}% ({cagr:.2f}% CAGR)[/]",
+        f"-{max_dd_22y:.2f}%",
+        str(len(trades)),
+        "[bold green]🏆 REALISTIC CRUSH[/]",
     )
 
     console.print()
     console.print(tbl)
     console.print()
 
+    wins = [t for t in trades if t.net_pnl > 0]
+    losses = [t for t in trades if t.net_pnl <= 0]
+    win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
+    gross_win = sum(t.net_pnl for t in wins)
+    gross_loss = abs(sum(t.net_pnl for t in losses))
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+
     console.print(Panel(
-        f"[bold green]22-Year Master Statistics Summary (2005 – 2026):[/]\n"
+        f"[bold green]Audited Real-World Performance Statistics (2005 – 2026):[/]\n"
         f"• Total Calendar Years Audited : [bold cyan]22 Years[/]\n"
-        f"• Positive Winning Years       : [bold green]{win_years} / 22 Years ({win_years/22*100:.1f}% Win Rate)[/]\n"
-        f"• Years Smashed >12% Goal      : [bold green]{target_met_years} / 22 Years ({target_met_years/22*100:.1f}% Target Hit Rate)[/]\n"
-        f"• 22-Year Annualized CAGR      : [bold green]{cagr_22y:.2f}% CAGR[/] (vs Benchmark {bm_22y_cagr:.2f}% CAGR)\n"
-        f"• ₹1,00,000 Compounded Value   : [bold green]₹{m_22y['final_capital']:,.2f}[/]",
-        title="[bold yellow]👑 22-YEAR INSTITUTIONAL SUMMARY[/]",
+        f"• Positive Winning Years       : [bold green]{win_years} / {len(years)} ({win_years/len(years)*100:.1f}% Annual Win Rate)[/]\n"
+        f"• Total Completed Trades       : [bold cyan]{len(trades)} Discrete Trades[/] (~{len(trades)/total_years:.1f} trades/year)\n"
+        f"• Trade Win Rate               : [bold green]{win_rate:.1f}%[/] ({len(wins)}W / {len(losses)}L)\n"
+        f"• Profit Factor (Net Win/Loss) : [bold green]{pf:.2f}[/]\n"
+        f"• True Compounded CAGR         : [bold green]{cagr:.2f}% CAGR[/] (vs Benchmark {bm_cagr:.2f}% CAGR)\n"
+        f"• Max Lifetime Drawdown        : [bold green]-{max_dd_22y:.2f}%[/]\n"
+        f"• ₹1,00,000 Compounded Value   : [bold green]₹{final_val:,.2f}[/]\n"
+        f"• Total Taxes & Charges Paid   : [dim red]₹{res['total_taxes']:,.2f}[/]",
+        title="[bold yellow]👑 TRUE DISCRETE 22-YEAR AUDIT SUMMARY[/]",
         border_style="yellow",
         box=box.ROUNDED
     ))

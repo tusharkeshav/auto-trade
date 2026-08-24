@@ -255,6 +255,9 @@ def run_discrete_22y_audit(
                 bar = df_s.iloc[pos_s]
                 prev_bar = df_s.iloc[pos_s - 1]
                 px = float(bar["close"])
+                op = float(bar.get("open", px))
+                hi = float(bar.get("high", px))
+                lo = float(bar.get("low", px))
                 prev_px = float(prev_bar["close"])
                 sma20 = float(bar.get("sma_20", px))
                 prev_sma20 = float(prev_bar.get("sma_20", prev_px))
@@ -266,7 +269,10 @@ def run_discrete_22y_audit(
                 rs_60 = float(df_s.iloc[pos_s - 60]["close"]) / float(df_bm.iloc[t_global - 60]["close"])
                 rs_slope = ((rs_today - rs_60) / rs_60) * 100.0
 
-                is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0)
+                # Bullish Green Reversal Filter (Loss Minimizer: Green Bar + Upper 50% Close)
+                is_bullish_reversal = (px >= op) and (hi > lo and px >= (lo + 0.50 * (hi - lo)))
+
+                is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0) and is_bullish_reversal
                 if is_pullback:
                     candidates.append((sym, "Large-Cap RS Pullback", px, atr, rs_slope))
 

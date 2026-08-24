@@ -69,6 +69,7 @@ class SimConfig:
     be_lock_r: float           # e.g. 2.0
     max_hold_bars: int         # e.g. 45
     gold_use_ema_gate: bool = False # If True, only buy Gold when Gold > 50 EMA, else hold 100% Cash
+    use_green_reversal: bool = False # If True, requires bounce candle to be Green (Close >= Open) & in upper 50% range
 
 
 @dataclass
@@ -279,6 +280,9 @@ def run_orchestrator_simulation(
                 bar = df_s.iloc[pos_s]
                 prev_bar = df_s.iloc[pos_s - 1]
                 px = float(bar["close"])
+                op = float(bar.get("open", px))
+                hi = float(bar.get("high", px))
+                lo = float(bar.get("low", px))
                 prev_px = float(prev_bar["close"])
                 sma20 = float(bar.get("sma_20", px))
                 prev_sma20 = float(prev_bar.get("sma_20", prev_px))
@@ -291,6 +295,11 @@ def run_orchestrator_simulation(
                 rs_slope = ((rs_today - rs_60) / rs_60) * 100.0
 
                 is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0)
+                
+                # Bullish Green Reversal Filter (Loss Minimizer)
+                if config.use_green_reversal:
+                    is_pullback = is_pullback and (px >= op) and (hi > lo and px >= (lo + 0.50 * (hi - lo)))
+
                 if is_pullback:
                     candidates.append((sym, "Large-Cap RS Pullback", px, atr, rs_slope))
 
@@ -434,6 +443,7 @@ def main():
         SimConfig(name="Baseline (Old Live: 5% SL / 25% TP)", gold_sl_pct=0.05, gold_tp_pct=0.25, pullback_tp_mult=3.5, be_lock_r=1.5, max_hold_bars=999, gold_use_ema_gate=False),
         SimConfig(name="Calibrated (8% SL / 15% TP)", gold_sl_pct=0.08, gold_tp_pct=0.15, pullback_tp_mult=4.0, be_lock_r=2.0, max_hold_bars=45, gold_use_ema_gate=False),
         SimConfig(name="Upgraded Shield (8% SL / 15% TP + 50-EMA Gate)", gold_sl_pct=0.08, gold_tp_pct=0.15, pullback_tp_mult=4.0, be_lock_r=2.0, max_hold_bars=45, gold_use_ema_gate=True),
+        SimConfig(name="Shield + Green Reversal (Loss Minimizer)", gold_sl_pct=0.08, gold_tp_pct=0.15, pullback_tp_mult=4.0, be_lock_r=2.0, max_hold_bars=45, gold_use_ema_gate=True, use_green_reversal=True),
     ]
 
     # 1. 2021–2024 Stress Test

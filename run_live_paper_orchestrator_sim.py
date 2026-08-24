@@ -236,9 +236,10 @@ def run_orchestrator_simulation(
                     pos_g = df_gold.index.get_loc(dt)
                     g_px = float(df_gold.loc[dt]["close"])
                     g_ema50 = float(df_gold["close"].iloc[:pos_g+1].ewm(span=50, adjust=False).mean().iloc[-1]) if pos_g >= 50 else g_px
+                    g_sma200 = float(df_gold["close"].iloc[:pos_g+1].rolling(200).mean().iloc[-1]) if pos_g >= 200 else g_px
 
-                    # If Gold 50-EMA Trend Gate is enabled, only enter if Gold > 50 EMA
-                    allow_gold_entry = (g_px > g_ema50) if config.gold_use_ema_gate else True
+                    # If Gold Dual-Trend Macro Gate is enabled, only enter if Gold > 50 EMA AND Gold > 200 SMA
+                    allow_gold_entry = (g_px > g_ema50 and g_px > g_sma200) if config.gold_use_ema_gate else True
 
                     if allow_gold_entry:
                         g_qty = math.floor((capital * 0.95) / g_px)

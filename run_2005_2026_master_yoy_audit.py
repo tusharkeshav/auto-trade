@@ -211,9 +211,10 @@ def run_discrete_22y_audit(
                 pos_g = df_gold.index.get_loc(dt)
                 g_px = float(df_gold.loc[dt]["close"])
                 g_ema50 = float(df_gold["close"].iloc[:pos_g+1].ewm(span=50, adjust=False).mean().iloc[-1]) if pos_g >= 50 else g_px
+                g_sma200 = float(df_gold["close"].iloc[:pos_g+1].rolling(200).mean().iloc[-1]) if pos_g >= 200 else g_px
 
-                # Gold 50-EMA Trend Gate: Only buy Gold if Gold > 50-EMA
-                if g_px > g_ema50:
+                # Gold Dual-Trend Macro Gate: Only buy Gold if Gold > 50-EMA AND Gold > 200-SMA
+                if g_px > g_ema50 and g_px > g_sma200:
                     if SAFE_ASSET_SYMBOL not in open_positions and capital > 2000:
                         g_qty = math.floor((capital * 0.95) / g_px)
                         if g_qty > 0:

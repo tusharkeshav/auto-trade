@@ -309,9 +309,10 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
         if df_gold is not None and len(df_gold) >= 50:
             g_px = float(df_gold["close"].iloc[-1])
             g_ema50 = float(df_gold["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            g_sma200 = float(df_gold["close"].rolling(200).mean().iloc[-1]) if len(df_gold) >= 200 else g_px
 
-            # Gold 50-EMA Trend Gate: Only buy Gold if Gold > 50-EMA
-            if g_px > g_ema50:
+            # Gold Dual-Trend Macro Gate: Only buy Gold if Gold > 50-EMA AND Gold > 200-SMA
+            if g_px > g_ema50 and g_px > g_sma200:
                 if SAFE_ASSET_SYMBOL not in [p["symbol"] for p in open_pos] and cash > 2000:
                     g_qty = math.floor((cash * 0.95) / g_px)
                     if g_qty > 0:
@@ -336,7 +337,7 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
                             console.print(f"[bold yellow]🛡️ Entered Sovereign Gold Defense: Bought {g_qty} units of GOLDBEES at ₹{g_px:.2f} (SL: ₹{g_px*0.92:.2f}, TP: ₹{g_px*1.15:.2f})[/]")
                             notifier.notify_trade_entry(SAFE_ASSET_SYMBOL, "Sovereign Gold Defense Shield", g_px, g_qty, round(g_px * 0.92, 2), round(g_px * 1.15, 2), 1.88, regime)
             else:
-                console.print(f"[bold cyan]🛡️ Gold Defense Gate: GOLDBEES (₹{g_px:.2f}) is below 50 EMA (₹{g_ema50:.2f}). Holding 100% Cash Shield to prevent drawdown.[/]")
+                console.print(f"[bold cyan]🛡️ Gold Dual-Trend Gate: GOLDBEES (₹{g_px:.2f}) is below 50 EMA (₹{g_ema50:.2f}) or 200 SMA (₹{g_sma200:.2f}). Holding 100% Cash Shield to prevent drawdown.[/]")
 
     elif available_slots > 0 and cash > 5000:
         alloc_per_slot = cash / available_slots
@@ -349,6 +350,9 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
             if df_s is None or len(df_s) < 60: continue
 
             px = float(df_s["close"].iloc[-1])
+            op = float(df_s["open"].iloc[-1]) if "open" in df_s else px
+            hi = float(df_s["high"].iloc[-1]) if "high" in df_s else px
+            lo = float(df_s["low"].iloc[-1]) if "low" in df_s else px
             prev_px = float(df_s["close"].iloc[-2])
             sma20 = float(df_s["sma_20"].iloc[-1]) if "sma_20" in df_s else px
             prev_sma20 = float(df_s["sma_20"].iloc[-2]) if "sma_20" in df_s else prev_px
@@ -360,8 +364,11 @@ def run_live_cycle(db: PaperOrchestratorDB, force: bool = False, is_cron: bool =
             rs_60 = float(df_s["close"].iloc[-60]) / float(df_bm["close"].iloc[-60])
             rs_slope = ((rs_today - rs_60) / rs_60) * 100.0
 
-            # Pullback Setup: Wholesale Dip at SMA20 + Healthy RSI + Positive RS Slope
-            is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0)
+            # Bullish Green Reversal Filter (Loss Minimizer: Green Bar + Upper 50% Close)
+            is_bullish_reversal = (px >= op) and (hi > lo and px >= (lo + 0.50 * (hi - lo)))
+
+            # Pullback Setup: Wholesale Dip at SMA20 + Healthy RSI + Positive RS Slope + Bullish Green Reversal
+            is_pullback = (prev_px <= prev_sma20 * 1.008) and (px > sma20) and (40.0 <= rsi <= 60.0) and (rs_slope > 0) and is_bullish_reversal
 
             if is_pullback:
                 candidates.append((sym, "Large-Cap RS Pullback", px, atr, rs_slope))
